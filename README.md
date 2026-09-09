@@ -130,52 +130,79 @@ error message instead.
 
 ## If I Had More Time
 
-1. ~~**Better section segmentation.**~~ **Implemented.** The original
-   regex-based header matcher required a header line to match a known
-   keyword *exactly* (e.g. plain "Experience"), which silently merged any
-   section with a compound header — "Internship / Training", "Work
-   Experience & Projects" — into whatever section preceded it. This was a
-   real correctness bug: it could hide genuine AI/Python evidence sitting in
-   an internship block and cause a qualified candidate to be wrongly
-   rejected. Fixed to match on the header keyword at the start of a short,
-   non-bulleted, non-sentence-like line instead of requiring an exact
-   full-line match. On the provided 50-resume set this moved 3 previously
-   wrongly-rejected candidates into the eligible pool, with zero regressions
-   (see `tests/test_eligibility.py::test_compound_section_header_is_recognized`).
+The items below were originally planned as future improvements and have
+since been implemented in this version:
 
-2. ~~**Always-on LLM extraction pass.**~~ **Implemented** (`parsing/llm_field_extractor.py`).
-   Gated behind `USE_LLM=true`, uses a structured Pydantic schema for the
-   response, and merges LLM output over the regex baseline field-by-field —
-   any field the LLM leaves empty or the call fails entirely falls back to
-   the regex extractor untouched, so extraction quality can only improve,
-   never regress, relative to the deterministic path. Wired into
-   `pipeline.py` so it's a drop-in swap with no other code changes needed.
+1. **Better section segmentation.** The original regex-based header matcher
+   required a header line to match a known keyword exactly (e.g. plain
+   "Experience"), which silently merged any section with a compound header
+   — "Internship / Training", "Work Experience & Projects" — into whatever
+   section preceded it. This was a real correctness bug: it could hide
+   genuine AI/Python evidence sitting in an internship block and cause a
+   qualified candidate to be wrongly rejected. Fixed to match on the header
+   keyword at the start of a short, non-bulleted, non-sentence-like line
+   instead of requiring an exact full-line match. On the provided 50-resume
+   set this moved 3 previously wrongly-rejected candidates into the
+   eligible pool, with zero regressions (see
+   `tests/test_eligibility.py::test_compound_section_header_is_recognized`).
 
-3. ~~**Persistent GitHub cache across runs.**~~ **Implemented**
-   (`github/enrichment.py`). A small on-disk JSON cache (`.cache/github_cache.json`
-   by default, path/TTL configurable via env vars) keyed by username, with a
-   24-hour TTL. Only stable outcomes (`ok`, `private_or_not_found`) are
-   persisted — transient failures (`rate_limited`, `error`) are intentionally
-   NOT cached so the next run retries them fresh rather than baking in a
-   temporary outage.
+2. **Always-on LLM extraction pass.** Implemented in
+   `parsing/llm_field_extractor.py`. Gated behind `USE_LLM=true`, uses a
+   structured Pydantic schema for the response, and merges LLM output over
+   the regex baseline field-by-field — any field the LLM leaves empty or
+   the call fails entirely falls back to the regex extractor untouched, so
+   extraction quality can only improve, never regress, relative to the
+   deterministic path.
 
-4. ~~**A lightweight FastAPI wrapper.**~~ **Implemented** (`app.py`).
+3. **Persistent GitHub cache across runs.** Implemented in
+   `github/enrichment.py`. A small on-disk JSON cache
+   (`.cache/github_cache.json` by default, path/TTL configurable via env
+   vars) keyed by username, with a 24-hour TTL. Only stable outcomes (`ok`,
+   `private_or_not_found`) are persisted — transient failures
+   (`rate_limited`, `error`) are intentionally not cached, so the next run
+   retries them fresh rather than baking in a temporary outage.
+
+4. **A lightweight FastAPI wrapper.** Implemented in `app.py`.
    `POST /screen {"input_dir": "..."}` runs the pipeline and returns a
    `run_id`; `GET /results/{run_id}` and `GET /results` (latest) return the
-   full report. Run with `uvicorn app:app --reload`. Kept intentionally thin —
-   all logic still lives in `pipeline.run_pipeline()`, this file is routing
-   and serialization only, per the brief's guidance not to over-invest in
-   the interface layer.
+   full report. Kept intentionally thin — all logic still lives in
+   `pipeline.run_pipeline()`, this file is routing and serialization only.
+
+5. **Resilient GitHub enrichment.** An earlier run showed roughly 30% of
+   eligible candidates with a real GitHub profile scoring `github: 0` with
+   a `rate_limited` status — a single 403/429 from GitHub was treated as
+   final instead of being retried, and the batch ran unauthenticated with
+   no `GITHUB_TOKEN` set. Added a retry helper in `github/enrichment.py`
+   that retries a 403/429 up to `GITHUB_MAX_RETRIES` times, honoring
+   `Retry-After` / `X-RateLimit-Reset` when GitHub sends them and falling
+   back to short exponential backoff otherwise. Also dropped
+   `GITHUB_MAX_WORKERS` from 4 to 2 by default, since GitHub's secondary
+   abuse-detection limit triggers on request bursts independent of
+   remaining quota, and added a one-time startup warning when no
+   `GITHUB_TOKEN` is configured, so the fix is visible instead of silently
+   producing zeros.
+
+6. **`.env` file loading.** `.env.example` told users to run
+   `cp .env.example .env` and fill it in, but nothing in the codebase
+   actually loaded that file — every setting was read with
+   `os.environ.get(...)`, which only sees real process environment
+   variables, not a plain `.env` file on disk. A user could fill in
+   `GITHUB_TOKEN` exactly right and still see the "not set" warning,
+   because the value never reached the process. `config.py` now loads
+   `.env` automatically at startup, via `python-dotenv` with a manual
+   `KEY=VALUE` parser as a fallback if that package is unavailable. Covered
+   by `tests/test_dotenv_loading.py`.
 
 ### Remaining ideas, if there were still more time
+
 - A layout-aware (not just regex) fallback for section segmentation on
   resumes with genuinely unconventional formatting (multi-column layouts,
   no clear headers at all).
-- Batch/async LLM calls for the extraction and scoring passes so `USE_LLM=true`
-  runs don't serialize one resume at a time.
-- A small `/screen` request option to run against an uploaded zip of resumes
-  directly, rather than requiring a server-local directory path.
+- Batch/async LLM calls for the extraction and scoring passes so
+  `USE_LLM=true` runs don't serialize one resume at a time.
 - Proactively call GitHub's `/rate_limit` endpoint once at batch start and,
   if remaining quota is clearly insufficient for the number of GitHub
-  profiles found, either slow the pool down further or surface a batch-level
-  warning up front instead of discovering it candidate-by-candidate.
+  profiles found, surface a batch-level warning up front instead of
+  discovering it candidate-by-candidate.
+- A `/screen` request option to run against an uploaded zip of resumes
+  directly, rather than requiring a server-local directory path.
